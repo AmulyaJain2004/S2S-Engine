@@ -20,6 +20,7 @@ script.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from pathlib import Path
 
@@ -54,10 +55,14 @@ class SchemaNotConfigured(RuntimeError):
 def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
     data_files = {"train": f"hf://datasets/{repo_id}/data/train/shard-*.tar"}
     dataset = load_dataset("webdataset", data_files=data_files, split="train", streaming=True)
-    dataset = dataset.cast_column("flac", Audio(decode=True))  # decode this time, we need real samples
+    # decode=False + soundfile, not datasets' Audio(decode=True): the
+    # torchcodec-backed decode path downmixes multi-channel FLAC to mono,
+    # which silently destroys the per-speaker channel separation this
+    # script depends on.
+    dataset = dataset.cast_column("flac", Audio(decode=False))
 
     sample = next(iter(dataset))
-    audio = sample["flac"]  # expected: {"array": np.ndarray, "sampling_rate": int} once decoded
+    raw_bytes = sample["flac"]["bytes"]
     raw_json = sample["json"]
     meta = json.loads(raw_json) if isinstance(raw_json, (bytes, str)) else raw_json
 
@@ -66,8 +71,8 @@ def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
     # convention this script assumed before that schema was available.
     session_id = meta["session_id"]
 
-    array = np.asarray(audio["array"])
-    sr = audio["sampling_rate"]
+    array_sc, sr = sf.read(io.BytesIO(raw_bytes), always_2d=True)  # (num_samples, num_channels)
+    array = array_sc.T  # -> (num_channels, num_samples), matching the rest of this function
 
     if array.ndim != 2 or array.shape[0] != 2:
         raise ValueError(f"Expected 2-channel stereo audio, got shape {array.shape}.")
