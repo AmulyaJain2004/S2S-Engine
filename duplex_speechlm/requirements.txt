@@ -1,0 +1,12 @@
+torch
+torchaudio
+transformers
+peft
+vocos
+datasets
+torchcodec
+huggingface_hub
+soundfile
+librosa
+accelerate
+pyyaml

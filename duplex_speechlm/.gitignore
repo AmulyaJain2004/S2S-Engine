@@ -1,0 +1,9 @@
+outputs/
+processed/
+*.wav
+*.flac
+*.pt
+*.bin
+__pycache__/
+*.pyc
+.env

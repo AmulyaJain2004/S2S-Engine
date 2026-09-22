@@ -1,0 +1,20 @@
+# P0 config: plumbing check only. No training happens at this stage.
+
+models:
+  wavlm_name: "microsoft/wavlm-base-plus"
+  qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  vocos_repo: "charactr/vocos-mel-24khz"
+
+audio:
+  target_sample_rate: 24000     # what Vocos expects; WavLM resamples internally to 16kHz on its own side
+  wavlm_sample_rate: 16000
+  chunk_duration_s: 5.0         # only used later for streaming; P0 uses whole short clips
+
+runtime:
+  device: "cuda"        # falls back to cpu automatically if cuda is unavailable
+  dtype: "float32"
+
+paths:
+  otospeech_data_files: "data/train/shard-*.tar"   # relative to the otoSpeech repo on the HF Hub
+  output_dir: "outputs"
+  processed_dir: "processed"
