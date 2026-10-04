@@ -13,9 +13,11 @@ audio:
                             # and kept (not dropped) as long as it's >= min_chunk_s -- see stage2_duplex.py
   min_chunk_s: 1.0          # shorter trailing remainders than this are dropped, too little signal to bother with
   n_mels: 100               # must match charactr/vocos-mel-24khz's own feature extractor
-  user_channel: 0           # Run dataprep/print_channel_roles.py and confirm this yourself --
-  agent_channel: 1          # train/stage2_duplex.py refuses to start unless channel_roles_verified is true below.
-  channel_roles_verified: false
+  user_channel: 0           # Run dataprep/print_channel_roles.py and confirm this yourself -- NOTE: this
+  agent_channel: 1          # dataset may turn out to be peer-to-peer (no real "agent" role), in which case
+                            # this is just a fixed, consistent choice of which channel the model learns to
+                            # produce, not "which one is really the user/agent". See that script's output.
+  channel_roles_verified: false   # train/stage2_duplex.py refuses to start unless this is true.
 
 lora:
   r: 16
