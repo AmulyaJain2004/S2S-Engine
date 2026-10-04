@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -N s2s_preprocess
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=06:00:00
+#PBS -q batch
+#PBS -j oe
+#PBS -o preprocess_job.log
+# EDIT ME: queue name / resource string, same caveat as run_stage2.pbs.
+# This job does NOT need a GPU -- it only streams+decodes audio and writes
+# WAV files, so request a CPU-only queue if your cluster has one (cheaper,
+# shorter queue wait than fighting for GPU nodes for a job that can't use one).
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR/.."
+
+source .venv/bin/activate
+
+echo "Job started: $(date)"
+# EDIT ME: must match the directory holding hpc/configs/stage2_hpc.yaml's
+# paths.manifest_path (i.e. PROCESSED_DIR below + "/manifest.json"). Keep
+# this in sync with the CHANGE_ME paths in that config file.
+PROCESSED_DIR="/scratch/CHANGE_ME/s2s-engine/processed"
+
+# Resumable (see dataprep/preprocess_otospeech.py's skip_existing logic):
+# re-running with the same --output_dir only processes sessions not already
+# in manifest.json, so a walltime cutoff mid-run is safe to just re-qsub.
+python dataprep/preprocess_otospeech.py --output_dir "$PROCESSED_DIR"
+
+echo "Job finished: $(date)"

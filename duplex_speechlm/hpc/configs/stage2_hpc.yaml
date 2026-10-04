@@ -1,0 +1,37 @@
+# Stage 2 config for the college H100 PBS cluster.
+# EDIT the two scratch paths below to match your actual cluster scratch/home
+# quota paths before qsub-ing -- these are placeholders.
+
+models:
+  wavlm_name: "microsoft/wavlm-base-plus"
+  qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  vocos_repo: "charactr/vocos-mel-24khz"
+
+audio:
+  chunk_duration_s: 8.0
+  min_chunk_s: 1.0
+  n_mels: 100
+  user_channel: 0           # Run dataprep/print_channel_roles.py and confirm this yourself --
+  agent_channel: 1          # train/stage2_duplex.py refuses to start unless channel_roles_verified is true below.
+  channel_roles_verified: false
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+train:
+  batch_size: 8             # H100 80GB has more headroom than the A100 40GB default in configs/stage2.yaml
+  lr: 2.0e-4
+  max_steps: 20000
+  save_every: 500
+  log_every: 20
+  num_workers: 8
+
+runtime:
+  device: "cuda"
+  dtype: "bf16"
+
+paths:
+  manifest_path: "/scratch/CHANGE_ME/s2s-engine/processed/manifest.json"
+  checkpoint_dir: "/scratch/CHANGE_ME/s2s-engine/checkpoints/stage2"

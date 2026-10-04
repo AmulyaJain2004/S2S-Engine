@@ -46,7 +46,7 @@ def main() -> None:
 
     print("Loading WavLM (frozen)...")
     wavlm = WavLMEncoder(cfg["models"]["wavlm_name"], device=device)
-    wavlm_features = wavlm(waveform, sr)
+    wavlm_features, wavlm_frame_mask = wavlm(waveform, sr)
     frame_rate = wavlm_features.shape[1] / duration_s
 
     print("Loading Vocos (frozen)...")

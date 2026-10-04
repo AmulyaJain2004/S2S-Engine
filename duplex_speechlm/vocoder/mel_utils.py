@@ -17,6 +17,12 @@ from __future__ import annotations
 import torch
 
 VOCOS_SAMPLE_RATE = 24000  # what charactr/vocos-mel-24khz expects on its input side
+VOCOS_HOP_LENGTH = 256     # verified against the installed vocos package's own feature extractor config
+                           # (see this module's docstring above) -- gives the ~93.75Hz mel frame rate.
+                           # Exposed here so anything that needs to estimate a target mel frame count
+                           # without already having ground-truth audio to call waveform_to_mel on
+                           # (e.g. eval/generate_stage2.py at real inference time) uses the same number
+                           # rather than re-guessing it.
 
 
 def waveform_to_mel(vocos_model, waveform: torch.Tensor) -> torch.Tensor:

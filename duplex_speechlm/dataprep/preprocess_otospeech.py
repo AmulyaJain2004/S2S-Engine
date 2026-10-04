@@ -52,16 +52,10 @@ class SchemaNotConfigured(RuntimeError):
     pass
 
 
-def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
-    data_files = {"train": f"hf://datasets/{repo_id}/data/train/shard-*.tar"}
-    dataset = load_dataset("webdataset", data_files=data_files, split="train", streaming=True)
-    # decode=False + soundfile, not datasets' Audio(decode=True): the
-    # torchcodec-backed decode path downmixes multi-channel FLAC to mono,
-    # which silently destroys the per-speaker channel separation this
-    # script depends on.
-    dataset = dataset.cast_column("flac", Audio(decode=False))
-
-    sample = next(iter(dataset))
+def _preprocess_sample(sample: dict, repo_id: str, output_dir: str) -> dict:
+    """Shared logic for turning one streamed WebDataset sample into a
+    processed/session_<id>/ directory. Returns the processed_meta dict
+    (also what gets written to metadata.json and folded into the manifest)."""
     raw_bytes = sample["flac"]["bytes"]
     raw_json = sample["json"]
     meta = json.loads(raw_json) if isinstance(raw_json, (bytes, str)) else raw_json
@@ -127,6 +121,7 @@ def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
     duration_s = array.shape[1] / sr
     processed_meta = {
         "session_id": session_id,
+        "session_dir": str(session_dir),
         "source_repo": repo_id,
         "sample_rate": sr,
         "duration_seconds": duration_s,
@@ -145,28 +140,120 @@ def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
     with open(metadata_path, "w") as f:
         json.dump(processed_meta, f, indent=2, default=str)
 
-    print("=== PREPROCESSING REPORT ===")
-    print(f"session:                {session_id}")
-    print(f"sample rate:            {sr}")
-    print(f"duration:               {duration_s:.2f}s")
-    print(f"redacted spans muted:   {len(redacted_spans)}")
-    print(f"events total/usable/interaction-primary: {len(all_events)}/{len(usable_events)}/{len(interaction_events)}")
-    print(f"observed event types (this session): {sorted({e.get('type') for e in usable_events})}")
-    print(f"saved to:               {session_dir}")
-
     # Basic validation
     assert speaker_0_path.exists() and speaker_1_path.exists(), "one or both speaker WAVs missing after write"
     dur0 = sf.info(str(speaker_0_path)).duration
     dur1 = sf.info(str(speaker_1_path)).duration
     assert abs(dur0 - dur1) < 0.01, f"speaker track durations misaligned: {dur0}s vs {dur1}s"
-    print("validation: both speaker files exist, durations aligned, sample rate consistent -- OK")
 
-    return session_dir
+    print(f"session {session_id}: {duration_s:.1f}s, events {len(all_events)}/{len(usable_events)}/"
+          f"{len(interaction_events)} (total/usable/interaction-primary), redacted spans muted: {len(redacted_spans)}")
+
+    return processed_meta
+
+
+def preprocess_one_session(repo_id: str, output_dir: str) -> Path:
+    """Back-compat single-sample entry point (used by the original P0-era
+    smoke test). Prefer preprocess_all_sessions for real training runs."""
+    data_files = {"train": f"hf://datasets/{repo_id}/data/train/shard-*.tar"}
+    dataset = load_dataset("webdataset", data_files=data_files, split="train", streaming=True)
+    dataset = dataset.cast_column("flac", Audio(decode=False))
+    sample = next(iter(dataset))
+    processed_meta = _preprocess_sample(sample, repo_id, output_dir)
+    print("=== PREPROCESSING REPORT (single session) ===")
+    for k, v in processed_meta.items():
+        if k != "interaction_events":
+            print(f"  {k}: {v}")
+    return Path(output_dir) / f"session_{processed_meta['session_id']}"
+
+
+def preprocess_all_sessions(
+    repo_id: str,
+    output_dir: str,
+    max_sessions: int | None = None,
+    skip_existing: bool = True,
+) -> Path:
+    """Streams through every shard in the dataset (no full download to a
+    single blob first) and preprocesses each session into
+    processed/session_<id>/, same as preprocess_one_session but for the
+    whole (or a capped subset of the) 20h corpus.
+
+    Writes processed/manifest.json at the end: a flat list of every
+    session's processed_meta, which train/stage2_duplex.py reads to build
+    its dataset index. Safe to re-run/resume: skip_existing=True (default)
+    skips any session_<id> directory that already has metadata.json,
+    so a Colab disconnect or PBS wall-time cutoff doesn't force a full
+    restart from session 1.
+    """
+    data_files = {"train": f"hf://datasets/{repo_id}/data/train/shard-*.tar"}
+    dataset = load_dataset("webdataset", data_files=data_files, split="train", streaming=True)
+    dataset = dataset.cast_column("flac", Audio(decode=False))
+
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = out_root / "manifest.json"
+    manifest: list[dict] = []
+    if manifest_path.exists():
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+    seen_ids = {m["session_id"] for m in manifest}
+
+    n_done, n_skipped, n_failed = 0, 0, 0
+    for i, sample in enumerate(dataset):
+        if max_sessions is not None and n_done >= max_sessions:
+            break
+
+        raw_json = sample["json"]
+        peek_meta = json.loads(raw_json) if isinstance(raw_json, (bytes, str)) else raw_json
+        session_id = peek_meta.get("session_id", f"unknown_{i}")
+
+        if skip_existing and session_id in seen_ids:
+            n_skipped += 1
+            continue
+
+        try:
+            processed_meta = _preprocess_sample(sample, repo_id, str(out_root))
+        except Exception as exc:  # noqa: BLE001 -- one bad session must not kill a multi-hour run
+            print(f"[WARN] session {session_id} (index {i}) failed to preprocess: {exc!r} -- skipping.")
+            n_failed += 1
+            continue
+
+        manifest.append(processed_meta)
+        seen_ids.add(session_id)
+        n_done += 1
+
+        if n_done % 10 == 0:
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2, default=str)
+            print(f"[checkpoint] {n_done} sessions processed so far, manifest saved.")
+
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+
+    total_hours = sum(m["duration_seconds"] for m in manifest) / 3600.0
+    print("\n=== FULL PREPROCESSING REPORT ===")
+    print(f"sessions newly processed: {n_done}")
+    print(f"sessions skipped (already done): {n_skipped}")
+    print(f"sessions failed:          {n_failed}")
+    print(f"total sessions in manifest: {len(manifest)}")
+    print(f"total audio in manifest:    {total_hours:.2f}h")
+    print(f"manifest written to:        {manifest_path}")
+
+    return manifest_path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo_id", default=REPO_ID)
     parser.add_argument("--output_dir", default="processed")
+    parser.add_argument("--one_session_only", action="store_true",
+                         help="Old P0-era behavior: process exactly one sample and stop.")
+    parser.add_argument("--max_sessions", type=int, default=None,
+                         help="Cap the number of NEW sessions processed this run (omit for the full dataset).")
     args = parser.parse_args()
-    preprocess_one_session(args.repo_id, args.output_dir)
+
+    if args.one_session_only:
+        preprocess_one_session(args.repo_id, args.output_dir)
+    else:
+        preprocess_all_sessions(args.repo_id, args.output_dir, max_sessions=args.max_sessions)

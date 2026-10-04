@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -N s2s_stage2
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -q gpu
+#PBS -j oe
+#PBS -o stage2_job.log
+# EDIT ME before qsub-ing: -l select=... (gres/gpu request syntax) and -q
+# (queue name) are placeholders -- every PBS cluster names its GPU resource
+# and queue differently. Run `qstat -Q` and check your cluster's docs/
+# `qsub --help` or ask the admins for the correct H100-requesting syntax,
+# then edit the two directives above to match. This will NOT land on an
+# H100 node with the wrong resource string -- it may queue forever, land
+# on the wrong GPU, or get rejected at submit time.
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR/.."   # repo root (duplex_speechlm/), assuming this script
+                          # is submitted from inside hpc/ -- see README
+
+source .venv/bin/activate
+
+echo "Job started: $(date)"
+echo "Node: $(hostname)"
+nvidia-smi
+
+# Resumable by design (see train/stage2_duplex.py's try_resume): if this job
+# gets killed by walltime before max_steps, just qsub this same script again
+# -- it picks up from the last checkpoint in checkpoint_dir rather than
+# restarting from step 0.
+python train/stage2_duplex.py --config hpc/configs/stage2_hpc.yaml
+
+echo "Job finished: $(date)"
