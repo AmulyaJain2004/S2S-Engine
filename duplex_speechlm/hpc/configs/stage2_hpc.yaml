@@ -29,6 +29,7 @@ train:
   save_every: 500
   log_every: 20
   num_workers: 8
+  flux_loss_weight: 0.5
 
 runtime:
   device: "cuda"

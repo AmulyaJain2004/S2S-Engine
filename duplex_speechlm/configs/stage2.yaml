@@ -31,6 +31,9 @@ train:
   save_every: 500
   log_every: 10
   num_workers: 4
+  flux_loss_weight: 0.5     # spectral-flux term (MELLE, arXiv:2407.08551) that penalizes under-predicting
+                            # frame-to-frame mel variation -- counters the over-smoothing plain L1/L2
+                            # regression is documented to cause. 0.0 disables it if it ever misbehaves.
 
 runtime:
   device: "cuda"

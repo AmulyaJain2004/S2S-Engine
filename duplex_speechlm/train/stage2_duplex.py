@@ -54,6 +54,20 @@ autoregressive transformer conditions on its own history -- so only the
 user stream is ever fed in as external input. This is a breaking change:
 old checkpoints trained against the previous DuplexFusion signature are
 not compatible and must be retrained from scratch.
+
+SPECTRAL FLUX LOSS (addresses a SEPARATE, well-documented limitation of
+plain L1 mel regression, not the leakage bug above): per MELLE
+(arXiv:2407.08551) and Ren et al. ("Revisiting Over-Smoothness in Text to
+Speech"), deterministic L1/L2 regression against mel targets tends to
+produce over-smoothed, blurry predictions -- averaging over plausible
+spectral detail minimizes L1 loss even though the average doesn't match
+any real frame. A spectral-flux term (L1 loss on the frame-to-frame
+first-order difference of predicted vs. target mel, weighted by
+train.flux_loss_weight) directly penalizes under-predicting the target's
+real temporal variation. This does not fully solve over-smoothing (MELLE
+also uses a variational/latent-sampling module instead of a deterministic
+readout, which this codebase does not implement) -- it is a cheap,
+directionally-correct mitigation, not a complete fix.
 """
 from __future__ import annotations
 
@@ -271,7 +285,7 @@ def train(cfg_path: str, resume: bool = True) -> None:
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if log_is_new:
-        log_writer.writerow(["step", "loss", "lr", "epoch", "wall_time_s"])
+        log_writer.writerow(["step", "loss", "recon_loss", "flux_loss", "lr", "epoch", "wall_time_s"])
 
     max_steps = cfg["train"]["max_steps"]
     save_every = cfg["train"]["save_every"]
@@ -334,7 +348,23 @@ def train(cfg_path: str, resume: bool = True) -> None:
 
                 mask_f = mel_mask.unsqueeze(1).to(target_mel.dtype)  # (B, 1, T_mel_max)
                 abs_diff = (pred_mel_aligned - target_mel).abs() * mask_f
-                loss = abs_diff.sum() / (mask_f.sum() * n_mels).clamp_min(1.0)
+                recon_loss = abs_diff.sum() / (mask_f.sum() * n_mels).clamp_min(1.0)
+
+                # Spectral flux loss (per MELLE, arXiv:2407.08551, and Ren et al.
+                # "Revisiting Over-Smoothness in TTS"): plain L1/L2 mel regression
+                # is documented to cause over-smoothed/blurry output, because
+                # averaging over plausible details minimizes L1 loss even though
+                # it doesn't match any real frame. Penalizing the mismatch in
+                # frame-to-frame variation directly discourages the model from
+                # under-predicting the target's actual temporal variation.
+                pred_flux = pred_mel_aligned[:, :, 1:] - pred_mel_aligned[:, :, :-1]
+                target_flux = target_mel[:, :, 1:] - target_mel[:, :, :-1]
+                flux_mask = mask_f[:, :, 1:]  # a flux frame is valid only if both frames behind it are
+                flux_diff = (pred_flux - target_flux).abs() * flux_mask
+                flux_loss = flux_diff.sum() / (flux_mask.sum() * n_mels).clamp_min(1.0)
+
+                flux_weight = cfg["train"].get("flux_loss_weight", 0.5)
+                loss = recon_loss + flux_weight * flux_loss
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -345,8 +375,10 @@ def train(cfg_path: str, resume: bool = True) -> None:
             if step % log_every == 0:
                 elapsed = time.time() - t0
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"step {step}/{max_steps} | epoch {epoch} | loss {loss.item():.4f} | elapsed {elapsed:.0f}s")
-                log_writer.writerow([step, loss.item(), lr, epoch, elapsed])
+                print(f"step {step}/{max_steps} | epoch {epoch} | loss {loss.item():.4f} "
+                      f"(recon {recon_loss.item():.4f} + {flux_weight}*flux {flux_loss.item():.4f}) | "
+                      f"elapsed {elapsed:.0f}s")
+                log_writer.writerow([step, loss.item(), recon_loss.item(), flux_loss.item(), lr, epoch, elapsed])
                 log_file.flush()
 
             if step % save_every == 0:
