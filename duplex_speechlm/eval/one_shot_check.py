@@ -1,27 +1,21 @@
-"""Diagnostic: does the trained checkpoint produce clean mel under the SAME
-teacher-forced conditions it was trained under -- i.e. with the real
-ground-truth agent audio as the duplex fusion's "previous output" stream,
-not the model's own self-generated audio?
+"""Diagnostic: does a ONE-SHOT, non-windowed forward pass (the whole chunk
+through Qwen in a single call, exactly like training does it) sound
+reasonable on a held-out chunk?
 
-Why this script exists: if eval/generate_stage2.py's autoregressive
-self-feedback output sounds like noise, there are two very different
-possible causes, and they need different fixes:
-  1. The acoustic head (acoustichead/mel_head.py is currently a single
-     nn.Linear, no temporal modeling) is too weak to produce clean mel
-     frames at all -- needs an architecture change + retrain.
-  2. Exposure bias: the model never saw its OWN imperfect past output
-     during training (training always uses real ground-truth audio for
-     that), so self-feedback generation can drift/compound errors fast --
-     fixable without retraining (shorter generations, better windowing,
-     scheduled sampling later, etc.).
+Why this still matters after the duplex-fusion redesign (see
+speechcore/duplex_fusion.py's docstring): training now processes a whole
+chunk in one non-cached forward call, while eval/generate_stage2.py
+processes the same audio window-by-window with a KV cache. Those two
+should be mathematically equivalent (a transformer's cached incremental
+decoding is supposed to produce the same result as one big forward pass),
+but it's cheap to verify directly rather than assume it: if this one-shot
+path sounds fine but generate_stage2.py's windowed output doesn't, the bug
+is in the windowing/KV-cache logic, not in training or model capacity.
 
-This script runs the EXACT same forward pass as train/stage2_duplex.py
-(one shot, teacher-forced with real agent audio, no window-by-window
-self-feedback loop) on a held-out chunk, vocodes the predicted mel, and
-saves it next to the ground-truth agent audio for that same chunk so you
-can compare them directly. If THIS also sounds like noise, cause #1 is
-the real problem. If this sounds reasonable but generate_stage2.py's
-output doesn't, cause #2 is the real problem.
+(Earlier versions of this script compared "teacher-forced" against
+"self-feedback" duplex fusion -- that distinction no longer exists, since
+duplex fusion only ever takes the user stream as input now, in both
+training and generation.)
 """
 from __future__ import annotations
 
@@ -68,44 +62,37 @@ def check(cfg_path: str, session_dir: str, offset_s: float, duration_s: float, o
     agent_chunk = agent_full.mean(dim=0)[start : start + length]
 
     user_16k = torchaudio.functional.resample(user_chunk, native_sr, WAVLM_SAMPLE_RATE)
-    agent_16k = torchaudio.functional.resample(agent_chunk, native_sr, WAVLM_SAMPLE_RATE)
     agent_24k = torchaudio.functional.resample(agent_chunk, native_sr, VOCOS_SAMPLE_RATE)
 
-    # Exactly train/stage2_duplex.py's forward pass: one combined WavLM call,
-    # teacher-forced fusion (real ground-truth agent embedding, shifted),
-    # single non-autoregressive forward through Qwen, no self-feedback loop.
-    combined_hidden, combined_mask = wavlm([user_16k, agent_16k], WAVLM_SAMPLE_RATE)
-    user_feat, agent_feat = combined_hidden[0:1], combined_hidden[1:2]
-
+    # Exactly train/stage2_duplex.py's forward pass: one non-cached WavLM +
+    # Qwen call over the whole chunk, user stream only.
+    user_feat, _ = wavlm([user_16k], WAVLM_SAMPLE_RATE)
     user_emb = projector(user_feat.to(dtype))
-    agent_emb = projector(agent_feat.to(dtype))
-    prev_output_emb = fusion.shift_with_start_token(agent_emb)
-    fused = fusion(user_emb, prev_output_emb)
-
+    fused = fusion(user_emb)
     hidden = qwen_core.forward(fused)  # non-cached, whole-chunk forward -- same as training
     pred_mel = acoustic_head(hidden).transpose(1, 2).float()
 
     target_mel = vocos.mel_from_waveform(agent_24k.unsqueeze(0))
     pred_mel = F.interpolate(pred_mel, size=target_mel.shape[-1], mode="linear", align_corners=False)
 
-    reconstructed = vocos.waveform_from_mel(pred_mel).cpu().squeeze(0)
+    reconstructed = vocos.waveform_from_mel(pred_mel).cpu().squeeze(0).clamp(-1.0, 1.0)
 
     gt_path = out_dir / "ground_truth_agent.wav"
-    pred_path = out_dir / "teacher_forced_predicted_agent.wav"
+    pred_path = out_dir / "one_shot_predicted_agent.wav"
     torchaudio.save(str(gt_path), agent_chunk.unsqueeze(0), native_sr)
     torchaudio.save(str(pred_path), reconstructed.unsqueeze(0), VOCOS_SAMPLE_RATE)
 
     mel_l1 = F.l1_loss(pred_mel, target_mel.float()).item()
     print(f"Checkpoint step: {step}")
-    print(f"Teacher-forced mel L1 on this held-out chunk: {mel_l1:.4f}")
+    print(f"One-shot (non-windowed) mel L1 on this held-out chunk: {mel_l1:.4f}")
     print(f"Saved: {gt_path}  (real ground-truth agent audio for this chunk)")
-    print(f"Saved: {pred_path}  (model's prediction, TEACHER-FORCED, no self-feedback)")
+    print(f"Saved: {pred_path}  (model's one-shot prediction, non-windowed, no KV cache)")
     print()
-    print("Compare this to generate_stage2.py's output on the same session:")
-    print("- If THIS sounds like noise too: the acoustic head (a single Linear layer) is")
-    print("  too weak -- needs a real architecture upgrade (conv/transformer stack) + retrain.")
-    print("- If THIS sounds reasonable but generate_stage2.py's self-feedback output doesn't:")
-    print("  exposure bias in autoregressive generation is the real problem, not training.")
+    print("Compare this to generate_stage2.py's windowed output on the same session:")
+    print("- If this sounds reasonable but generate_stage2.py's windowed output doesn't:")
+    print("  the windowing/KV-cache logic has a bug -- the two should be equivalent.")
+    print("- If both sound similar (good or bad): the model/training itself is the story,")
+    print("  not the windowing mechanism.")
 
 
 if __name__ == "__main__":

@@ -14,9 +14,11 @@ speech core (fine-tuned) -> Acoustic head (trainable) -> Vocos (frozen).
 - Qwen2.5-1.5B-Instruct loader with the embedding-path override (accepts
   continuous `inputs_embeds`, never calls the pretrained `lm_head`) and
   optional LoRA wrapping (`speechcore/qwen_speech_core.py`)
-- Duplex fusion: concat user-frame + previous-output-frame embedding, one
-  learned linear projection, per spec section 2 (`speechcore/duplex_fusion.py`)
-- A placeholder acoustic head, still just a linear projection
+- Duplex fusion: projects the user-frame embedding to the speech core's
+  hidden size (`speechcore/duplex_fusion.py`) -- see "corrected design"
+  below, this is NOT the original concat-with-previous-output design
+- A real acoustic head: Conv1D temporal context + a residual postnet
+  refinement (Tacotron2-style), not a bare linear readout
   (`acoustichead/mel_head.py`)
 - An empty placeholder for personalization memory, explicitly Stage 4 work (`memory/`)
 - otoSpeech dataset inspection + full-manifest (resumable, all-sessions)
@@ -24,23 +26,41 @@ speech core (fine-tuned) -> Acoustic head (trainable) -> Vocos (frozen).
 - Stage 2 training loop (`train/stage2_duplex.py`, `configs/stage2.yaml`),
   skipping Stage 1's synthetic content-bootstrap by direct instruction --
   trains directly on real otoSpeech duplex audio
-- Stage 2 inference/listening script (`eval/generate_stage2.py`): real
-  autoregressive duplex generation from a trained checkpoint (self-feedback,
-  KV-cached, windowed per the spec's own ~300-500ms chunk latency) -- the
+- Stage 2 inference/listening script (`eval/generate_stage2.py`): windowed,
+  KV-cached generation using the exact same mechanism as training -- the
   only way to actually hear what Stage 2 learned, since training loss alone
   doesn't tell you that
 - A Colab A100 notebook (`notebooks/colab_stage2_a100.ipynb`) and an H100
   PBS-cluster job folder (`hpc/`), both driving the same training AND
   generation scripts
 
-**Previously flagged gaps, now resolved -- read the comments at the top of
+**Corrected design (a real bug, not a flagged gap -- read
+`speechcore/duplex_fusion.py`'s docstring for the full reasoning):** duplex
+fusion originally concatenated the user-frame embedding with the real
+ground-truth agent audio's embedding, shifted by one 20ms frame. Adjacent
+real-speech frames are highly autocorrelated, so this gave the model an
+easy training shortcut -- echo the ground truth forward -- instead of
+learning genuine content generation. It also meant training and real
+inference used different mechanisms (inference has no ground-truth agent
+audio), which is why generation-time self-feedback produced persistent
+noise that no amount of inference-side signal processing (clamping,
+loudness-matching, crossfading -- all tried, none fixed it) could resolve.
+Confirmed by a direct test: a one-shot forward pass fed real ground-truth
+audio produced actual intelligible words, proving the model/training
+weren't the bottleneck -- the fusion mechanism was. Fixed by dropping the
+explicit "previous output" input entirely; the speech core's own causal
+self-attention over its own past hidden states now carries that memory,
+the standard way any autoregressive transformer conditions on its own
+history. **This was a breaking change -- any checkpoint trained before
+this fix is incompatible and must be retrained from scratch.**
+
+**Previously flagged gaps, resolved -- read the comments at the top of
 `train/stage2_duplex.py` for the full reasoning:**
 - WavLM's ~50Hz and Vocos's real ~93.75Hz mel rate have no integer ratio.
   Resolved by resampling the acoustic head's output along time, per item,
   to that item's own true mel length (computed from the real masks below,
-  not a batch-wide approximation) -- the acoustic head is a plain Linear
-  with no time-mixing, so this is a legitimate rate bridge, not a quality
-  shortcut hiding a real bug.
+  not a batch-wide approximation) -- this is a legitimate rate bridge
+  between two fixed, externally-defined rates, not a quality shortcut.
 - Training chunks are variable-length, not fixed-and-dropped: each
   session's trailing remainder is kept (down to `audio.min_chunk_s`), and
   `WavLMEncoder` now returns a real frame-level attention mask (via HF's

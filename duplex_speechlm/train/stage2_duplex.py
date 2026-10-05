@@ -35,6 +35,25 @@ refuses to start unless audio.channel_roles_verified: true is set in the
 config, which should only happen after running
 dataprep/print_channel_roles.py and confirming audio.user_channel /
 audio.agent_channel against the real otoSpeech speaker-role metadata.
+
+DUPLEX FUSION NO LONGER TAKES AGENT AUDIO AS INPUT (corrected design, not
+just a refactor -- see speechcore/duplex_fusion.py's docstring for the
+full reasoning). The previous version fed the real ground-truth agent
+audio's embedding (shifted by one 20ms frame) into the model's own input
+at every frame. Adjacent real-speech frames are highly autocorrelated, so
+this gave the model an easy shortcut -- echo the ground truth forward --
+instead of learning genuine content generation from the user audio and
+its own understanding. It also meant training and real inference used
+different mechanisms (real inference has no ground-truth agent audio to
+lean on), which is exactly why generation-time self-feedback kept
+producing noise no amount of inference-side signal processing fixed: the
+model never actually learned to generate independently. The speech core's
+own causal self-attention over its own past hidden states is what now
+carries "memory of what I've been saying" -- the standard way any
+autoregressive transformer conditions on its own history -- so only the
+user stream is ever fed in as external input. This is a breaking change:
+old checkpoints trained against the previous DuplexFusion signature are
+not compatible and must be retrained from scratch.
 """
 from __future__ import annotations
 
@@ -274,19 +293,14 @@ def train(cfg_path: str, resume: bool = True) -> None:
             # WavLMEncoder's feature extractor needs CPU tensors (it calls
             # .numpy() on each row) -- moving to `device` first would break that.
             user_16k = [torchaudio.functional.resample(w, native_sr, WAVLM_SAMPLE_RATE) for w in user_list]
-            agent_16k = [torchaudio.functional.resample(w, native_sr, WAVLM_SAMPLE_RATE) for w in agent_list]
             agent_24k = [torchaudio.functional.resample(w, native_sr, VOCOS_SAMPLE_RATE) for w in agent_list]
             batch_size = len(user_16k)
 
             with torch.no_grad():
-                # One combined WavLM call over user+agent so both streams share
-                # identical padding and the frame mask is directly comparable.
-                combined_hidden, combined_mask = wavlm(user_16k + agent_16k, WAVLM_SAMPLE_RATE)
-                user_feat, agent_feat = combined_hidden[:batch_size], combined_hidden[batch_size:]
-                # user/agent chunks come from the same start/length per index entry,
-                # so their masks should already match; take the elementwise AND as a
-                # safety net against any independent-resample rounding difference.
-                frame_mask = torch.minimum(combined_mask[:batch_size], combined_mask[batch_size:])
+                # Only the user stream is ever encoded as model input now --
+                # agent audio is used solely to build the loss target below,
+                # never fed into the model (see the duplex-fusion note above).
+                user_feat, frame_mask = wavlm(user_16k, WAVLM_SAMPLE_RATE)
 
                 # Exact per-item mel targets (no batch-wide length assumption),
                 # then zero-padded to the batch's max mel length with an explicit mask.
@@ -302,9 +316,7 @@ def train(cfg_path: str, resume: bool = True) -> None:
 
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
                 user_emb = projector(user_feat.to(dtype))
-                agent_emb = projector(agent_feat.to(dtype))
-                prev_output_emb = fusion.shift_with_start_token(agent_emb)
-                fused = fusion(user_emb, prev_output_emb)
+                fused = fusion(user_emb)
 
                 hidden = qwen_core(fused, attention_mask=frame_mask)  # (B, T_wavlm, hidden)
                 pred_mel_full = acoustic_head(hidden).transpose(1, 2).float()  # (B, n_mels, T_wavlm)

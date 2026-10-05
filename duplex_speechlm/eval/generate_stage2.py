@@ -3,82 +3,43 @@ from a trained checkpoint. This is the only way to actually hear what
 Stage 2 learned -- a falling training loss alone does not tell you the
 output is intelligible or that duplex timing makes sense.
 
-TRAIN/INFERENCE MISMATCH (exposure bias -- flagged, not hidden):
-train/stage2_duplex.py teacher-forces the "previous output frame
-embedding" half of duplex fusion using the REAL ground-truth agent audio,
-shifted by one frame -- the model never has to rely on its own imperfect
-past output during training. This script instead feeds back the model's
-OWN synthesized audio from the previous window, which is the only option
-at real inference time (there is no ground-truth agent audio to use).
-This is the standard autoregressive exposure-bias gap: expect generation
-quality to degrade more over a long run than the training loss alone
-would suggest, especially after a short training run. Revisit with
-scheduled sampling or more Stage 2 training if this bites.
+SIMPLIFIED, TRAIN/INFERENCE-CONSISTENT DESIGN (previous version re-encoded
+the model's own synthesized audio through WavLM every window as a
+"previous output" signal for duplex fusion, mirroring how training used
+to feed back ground-truth agent audio. That whole mechanism is gone --
+see speechcore/duplex_fusion.py's docstring. It was also the actual
+source of the noisy output in earlier runs: no amount of clamping,
+loudness-matching, or crossfading the re-encoded audio fixed it, because
+the problem was never signal corruption in that loop, it was that the
+model had never learned genuine content generation in the first place
+(the old design let it shortcut training by echoing real ground-truth
+audio instead). Generation now uses the EXACT mechanism training uses:
+only the user stream is ever encoded and fed in; the speech core's own
+causal self-attention (carried across windows via the Qwen KV cache)
+provides whatever "memory of what I've been saying" it needs, with no
+re-encoded audio injected at all.
 
-WINDOWED, NOT PER-FRAME, DUPLEX FUSION (by design, not a shortcut): true
-frame-by-frame (20ms) self-feedback would require vocoding every single
-frame through Vocos and re-encoding it through WavLM before the NEXT
-frame could even be computed -- Vocos isn't causal at that granularity
-and WavLM has its own multi-frame receptive field, so that would be both
-wrong and extremely slow. Per spec section 2's own accepted trade-off
-("process audio in fixed chunks (roughly 300-500ms)"), this script
-generates in windows of `--window_s` (default 0.4s): each window's duplex
-fusion uses the PREVIOUS window's self-synthesized audio (re-encoded
-through WavLM + projector, then time-aligned to the current window's
-frame count) as the "previous output" stream -- not literally the one
-immediately preceding frame. A Qwen KV cache carries real cross-window
-context so the speech core still sees its full history, not just the
-current window in isolation.
+WINDOWED, NOT PER-FRAME (still true, and still a deliberate choice, now
+for a much simpler reason): WavLM has a multi-frame receptive field and
+Vocos vocodes in chunks, so true 20ms-frame-by-frame streaming still isn't
+practical -- generation still proceeds in `--window_s` windows (default
+0.4s, matching spec section 2's own accepted ~300-500ms chunk-latency
+trade-off), encoding each window's user audio and running one KV-cached
+Qwen step per window. There is no self-feedback loop left to need
+windowing for; this windowing is purely about WavLM/Vocos chunk granularity.
 
-FIRST WINDOW: there is no self-generated history yet, so duplex fusion
-for window 0 uses the learned start token (the same one position 0 uses
-in training) broadcast across the whole window, not a single frame.
-
-CLAMPING THE SELF-FED AUDIO (fixes a real, confirmed bug, not a cosmetic
-safeguard): Vocos's raw output is NOT guaranteed to stay within [-1, 1] --
-nothing in vocos_wrapper.py/mel_utils.py clips it. WavLM, however, expects
-input in roughly that range (it was pretrained on normalized natural
-speech); feeding it out-of-range values produces badly corrupted
-features. The teacher-forced path (train/stage2_duplex.py,
-eval/teacher_forced_check.py) NEVER re-encodes synthesized audio through
-WavLM, so it was never exposed to this. This self-feedback path does, every
-single window, which compounds across windows -- confirmed by
-teacher_forced_check.py sounding clean while this script's output didn't.
-Every self-fed chunk is clamped to [-1, 1] before being re-encoded (and
-before being saved/concatenated) to close this off. Confirmed live: on one
-real run, windows 61 and 64 hit values up to 1.42 before this fix.
-
-LOUDNESS DRIFT (a second, separate distribution-shift source): clamping
-stops catastrophic overflow, but the self-fed audio's overall loudness can
-still drift away from whatever WavLM saw in training (real human speech,
-not vocoder output played back into itself repeatedly). The copy fed back
-into WavLM for the next window's duplex fusion (NOT the saved/listened
-output -- that stays the model's honest, unmodified prediction) has its
-RMS matched to the real input window's RMS each step, as a cheap guard
-against this compounding.
-
-WINDOW-BOUNDARY ARTIFACTS ("echo"-like flutter): each window's mel is
-vocoded independently by Vocos, which carries no phase/overlap state
-across calls, then windows are hard-concatenated -- any phase mismatch at
-each cut is an audible click/discontinuity every `--window_s`, which can
-read as flutter or echo. A short linear crossfade is applied at each
-stitch point in the final saved output to mask this; it does not change
-what gets fed back into the model, only how the final waveform is
-assembled.
-
-These three fixes reduce DIFFERENT sources of generation-time distortion
-on top of real model output -- none of them make the model itself smarter.
-If output is still not intelligible after all three, the remaining gap is
-the actual exposure-bias/distribution-shift problem these mitigate but
-don't eliminate, and the real fix is scheduled sampling during Stage 2
-training (expose the model to its own imperfect output while training,
-not just ground truth) or more Stage 2 training steps/data.
+OUTPUT-SIDE SAFETY (kept from before, still cheap and still worth doing):
+Vocos's raw output is not guaranteed to stay within [-1, 1], so it's
+clamped before saving. Each window is still vocoded independently with no
+shared phase state, so a short crossfade is still applied at each stitch
+point in the final saved waveform to mask boundary clicks.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -92,11 +53,7 @@ from train.stage2_duplex import build_models  # reuse the EXACT same model const
 from vocoder.mel_utils import VOCOS_HOP_LENGTH, VOCOS_SAMPLE_RATE
 
 
-def _rms(x: torch.Tensor) -> torch.Tensor:
-    return x.pow(2).mean().clamp_min(1e-8).sqrt()
-
-
-def _crossfade_concat(chunks: list, fade_samples: int) -> torch.Tensor:
+def _crossfade_concat(chunks: List[torch.Tensor], fade_samples: int) -> torch.Tensor:
     """Concatenates waveform chunks with a short linear crossfade at each
     boundary instead of a hard cut, to mask the phase discontinuity each
     independently-vocoded window introduces. fade_samples is clamped to
@@ -155,11 +112,10 @@ def generate(cfg_path: str, user_wav_path: str, window_s: float, max_duration_s:
     n_windows = max(1, (user_wave.shape[0] + window_len - 1) // window_len)
 
     past_key_values = None
-    prev_output_wave_native = None  # previous window's self-synthesized audio, at native_sr
     synthesized_chunks = []
 
     print(f"Generating {n_windows} window(s) of {window_s}s each from checkpoint step {step} "
-          f"(self-feedback, KV-cached Qwen)...")
+          f"(user-only input, KV-cached Qwen, no self-feedback loop)...")
     for i in range(n_windows):
         start = i * window_len
         window = user_wave[start : start + window_len]
@@ -172,25 +128,8 @@ def generate(cfg_path: str, user_wav_path: str, window_s: float, max_duration_s:
         user_16k = torchaudio.functional.resample(window, native_sr, WAVLM_SAMPLE_RATE)
         user_feat, _ = wavlm([user_16k], WAVLM_SAMPLE_RATE)  # (1, T_u, 768); batch of 1, no real padding
         user_emb = projector(user_feat.to(dtype))  # (1, T_u, hidden)
-        t_u = user_emb.shape[1]
 
-        if prev_output_wave_native is None:
-            prev_output_emb = fusion.start_token.view(1, 1, -1).expand(1, t_u, -1).to(dtype)
-        else:
-            prev_16k = torchaudio.functional.resample(prev_output_wave_native, native_sr, WAVLM_SAMPLE_RATE)
-            prev_feat, _ = wavlm([prev_16k], WAVLM_SAMPLE_RATE)
-            prev_emb = projector(prev_feat.to(dtype))  # (1, T_prev, hidden)
-            # Time-align the previous window's embedding to THIS window's frame
-            # count -- the same legitimate rate-bridging interpolation used in
-            # training, needed because the previously vocoded window's duration
-            # rarely matches the input window's duration exactly.
-            prev_output_emb = (
-                F.interpolate(prev_emb.transpose(1, 2).float(), size=t_u, mode="linear", align_corners=False)
-                .transpose(1, 2)
-                .to(dtype)
-            )
-
-        fused = fusion(user_emb, prev_output_emb)  # (1, T_u, hidden)
+        fused = fusion(user_emb)  # (1, T_u, hidden) -- no "previous output" input anymore
         hidden, past_key_values = qwen_core.forward_step(fused, past_key_values)
         pred_mel = acoustic_head(hidden).transpose(1, 2).float()  # (1, n_mels, T_u)
 
@@ -202,18 +141,8 @@ def generate(cfg_path: str, user_wav_path: str, window_s: float, max_duration_s:
         target_mel_frames = max(1, window_samples_24k // VOCOS_HOP_LENGTH + 1)
         pred_mel = F.interpolate(pred_mel, size=target_mel_frames, mode="linear", align_corners=False)
 
-        waveform_window = vocos.waveform_from_mel(pred_mel).cpu().squeeze(0)  # (n_samples_24k,)
-        raw_min, raw_max = waveform_window.min().item(), waveform_window.max().item()
-        if raw_min < -1.0 or raw_max > 1.0:
-            print(f"  [window {i + 1}] Vocos output out of [-1, 1] before clamping: "
-                  f"min={raw_min:.3f} max={raw_max:.3f} -- this is exactly the corruption this clamp prevents.")
-        waveform_window = waveform_window.clamp(-1.0, 1.0)
-        synthesized_chunks.append(waveform_window)  # the honest, unmodified output -- saved as-is
-
-        waveform_24k = torchaudio.functional.resample(window, native_sr, VOCOS_SAMPLE_RATE)
-        loudness_scale = (_rms(waveform_24k) / _rms(waveform_window)).clamp(0.2, 5.0)
-        feedback_window = (waveform_window * loudness_scale).clamp(-1.0, 1.0)
-        prev_output_wave_native = torchaudio.functional.resample(feedback_window, VOCOS_SAMPLE_RATE, native_sr)
+        waveform_window = vocos.waveform_from_mel(pred_mel).cpu().squeeze(0).clamp(-1.0, 1.0)
+        synthesized_chunks.append(waveform_window)
 
         if (i + 1) % 10 == 0 or i == n_windows - 1:
             print(f"  window {i + 1}/{n_windows} done")
@@ -227,9 +156,8 @@ def generate(cfg_path: str, user_wav_path: str, window_s: float, max_duration_s:
     torchaudio.save(str(user_out_path), user_wave.unsqueeze(0), native_sr)
 
     print(f"\nSaved: {user_out_path}  (what the model heard)")
-    print(f"Saved: {out_path}  (what the model generated -- self-feedback autoregressive, NOT teacher-forced,")
-    print("  with [-1,1] clamping, loudness-matched feedback, and crossfaded window stitching applied)")
-    print("Listen to both. This is the honest test of what Stage 2 actually learned, exposure bias and all --")
+    print(f"Saved: {out_path}  (what the model generated)")
+    print("Listen to both. This is the honest test of what Stage 2 actually learned --")
     print("a low training loss does not by itself mean this sounds like intelligible, well-timed speech.")
 
 

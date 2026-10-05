@@ -1,15 +1,32 @@
-"""Duplex fusion: concatenate the incoming user-frame embedding with the
-speech core's own previous-frame output embedding, then project down to the
-speech core's hidden size with a single learned linear layer.
+"""Duplex fusion: projects the incoming user-frame embedding to the speech
+core's hidden size.
 
-Per spec section 2, this is deliberately the simplest possible fusion
-function -- a concrete first pass for Stage 2 to run and iterate from, not
-a final design.
+CORRECTED DESIGN (previous version concatenated the user-frame embedding
+with the real ground-truth agent audio's embedding, shifted by one 20ms
+frame, per an early reading of spec section 2). That created a training
+shortcut: adjacent 20ms frames of real speech are highly autocorrelated,
+so the model could minimize training loss by mostly echoing the
+ground-truth "previous frame" forward, instead of actually learning to
+generate agent content from the user audio + the speech core's own
+understanding. It also meant training and inference used DIFFERENT
+mechanisms: training always had real ground-truth audio to lean on,
+while real inference never does (there is no ground-truth agent audio at
+deployment time), forcing a fragile synthesize-then-re-encode self-feedback
+loop at inference that kept producing noise no amount of signal-processing
+patching (clamping, loudness-matching, crossfading) fixed -- because the
+problem was never signal corruption, it was that the model had never
+learned genuine content generation in the first place.
 
-Training-time note: "the speech core's own previously generated frame
-embedding" is replaced by the ground-truth agent-channel embedding, shifted
-by one frame (standard teacher forcing). At inference time this would
-instead be the model's own last output, fed back in.
+This version drops the explicit "previous output" input entirely. The
+speech core (Qwen, causal self-attention) already carries forward its own
+history through its own hidden states at every earlier frame position --
+that is what an autoregressive transformer's hidden state IS -- so an
+explicit re-injection of (re-encoded) past audio is both unnecessary and,
+per the above, actively harmful. Training and inference now use the
+IDENTICAL mechanism: only the user stream is ever fed in as external
+input; whatever "memory of what I've been saying" the model needs comes
+from its own hidden states via self-attention / the KV cache, exactly the
+way any autoregressive LM conditions on its own past outputs.
 """
 from __future__ import annotations
 
@@ -19,28 +36,15 @@ import torch.nn as nn
 
 class DuplexFusion(nn.Module):
     def __init__(self, d_in: int, d_hidden: int) -> None:
-        """d_in: the per-stream embedding width (projector output width,
-        i.e. the speech core's hidden size -- user and prior-output frames
-        are both already projected to this width before fusion).
-        d_hidden: the speech core's hidden size (fusion output width)."""
+        """d_in: the projector's output width (already the speech core's
+        hidden size). d_hidden: the speech core's hidden size. Kept as a
+        separate learned layer (rather than folding into the projector)
+        so this adaptation can specialize for the speech core's input
+        distribution independently of the projector's acoustic-feature role."""
         super().__init__()
-        self.proj = nn.Linear(2 * d_in, d_hidden)
-        self.start_token = nn.Parameter(torch.zeros(d_in))
+        self.proj = nn.Linear(d_in, d_hidden)
 
-    def forward(self, user_emb: torch.Tensor, prev_output_emb: torch.Tensor) -> torch.Tensor:
-        """user_emb, prev_output_emb: (B, T, d_in), already time-aligned and
-        already shifted by one frame by the caller (prev_output_emb[:, t] is
-        the agent-channel embedding at t-1; the caller is responsible for
-        that shift and for filling position 0 with self.start_token).
-        Returns: (B, T, d_hidden) fused embeddings ready to feed into the
-        speech core as inputs_embeds."""
-        fused = torch.cat([user_emb, prev_output_emb], dim=-1)
-        return self.proj(fused)
-
-    def shift_with_start_token(self, agent_emb: torch.Tensor) -> torch.Tensor:
-        """agent_emb: (B, T, d_in) ground-truth agent-channel embedding.
-        Returns the teacher-forcing input: agent_emb shifted right by one
-        frame, with position 0 filled by the learned start token."""
-        b, t, d = agent_emb.shape
-        start = self.start_token.view(1, 1, d).expand(b, 1, d).to(agent_emb.dtype)
-        return torch.cat([start, agent_emb[:, :-1, :]], dim=1)
+    def forward(self, user_emb: torch.Tensor) -> torch.Tensor:
+        """user_emb: (B, T, d_in) -> (B, T, d_hidden), ready to feed into
+        the speech core as inputs_embeds."""
+        return self.proj(user_emb)
