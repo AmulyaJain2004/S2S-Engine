@@ -3,71 +3,52 @@
 Per spec section 7, Stage 2 is what actually teaches backchannel/
 interruption/overlap behavior -- it trains on real duplex audio, not
 synthetic single-turn TTS pairs. This script skips Stage 1 (content
-bootstrap) by direct instruction: we warm-start everything from frozen
-WavLM + pretrained Qwen2.5-1.5B-Instruct + frozen Vocos, and train only
-the new/adapted pieces (projector, duplex fusion, LoRA on Qwen, acoustic
-head) directly on real duplex data.
+bootstrap) by direct instruction.
 
-RATE MISMATCH (resolved, not just flagged): WavLM runs at its native ~50Hz
-and Vocos's real mel config (vocoder/mel_utils.py, verified against the
-installed package) runs at ~93.75Hz (24kHz / hop_length 256) -- there is no
-integer ratio between them. Since the acoustic head is a plain nn.Linear
-with no time-mixing, resampling its output along the time axis to the
-target mel length is equivalent (up to interpolation choice) to resampling
-the hidden states first; this script does it on the acoustic head's output,
-per-item, against each item's OWN true mel length (not a batch-wide
-average), using the exact valid-frame counts from the masks below -- not an
-approximation over padded regions. The model cannot genuinely produce more
-time-resolution than WavLM's 50Hz gives it; this interpolation is a
-resampling bridge between two fixed, externally-defined rates, not a
-quality shortcut.
+ARCHITECTURE: DISCRETE UNITS, NOT CONTINUOUS MEL REGRESSION (a deliberate,
+researched pivot -- see speechcore/discrete_tokenizer.py's docstring for
+the full reasoning and citations). Both the user and agent streams are
+encoded into discrete unit IDs by a frozen, pretrained WavLM-large +
+k-means(1000) pipeline (speechbrain's DiscreteSSL). The speech core
+(Qwen2.5-1.5B-Instruct, LoRA-adapted) is trained as an ordinary
+autoregressive classifier: embed the user units, predict the agent's
+units at each frame via cross-entropy. This matches how dGSLM and Moshi
+-- the validated full-duplex speech-LM systems in the literature -- are
+actually built, and avoids two separate real problems the previous
+continuous-mel-regression version had:
+  1. Over-smoothed/blurry output (a documented property of plain L1/L2
+     mel regression -- MELLE, arXiv:2407.08551) is structurally impossible
+     here: classification doesn't average over plausible targets the way
+     deterministic regression does.
+  2. The WavLM-50Hz-vs-Vocos-93.75Hz rate mismatch, and the per-item
+     interpolation code it required, no longer exists: both the user and
+     agent streams are unit sequences from the SAME WavLM+k-means
+     pipeline, so they share an identical frame count by construction
+     (asserted below, not just assumed).
 
-VARIABLE-LENGTH CHUNKS (resolved, not dropped): sessions are chopped into
-fixed-length, non-overlapping chunks, but each session's trailing
-remainder is KEPT (not discarded) as long as it's >= audio.min_chunk_s.
-WavLMEncoder.forward returns a real frame-level attention mask (computed
-by HF's own conv-stride-aware helper, not a guessed ratio), which is
-threaded through the speech core's attention and through the mel loss so
-padded frames never contribute to gradients or attention.
+ONLY THE USER STREAM IS EVER FED IN AS MODEL INPUT (carried over from the
+previous fix, and still correct under this new architecture): the speech
+core's own causal self-attention over its own past hidden states is what
+carries "memory of what it's been saying" -- the standard way any
+autoregressive transformer conditions on its own history. Training and
+eval/generate_stage2.py's generation now use the exact same mechanism,
+with no self-feedback audio loop anywhere.
 
-CHANNEL-ROLE ASSUMPTION (now a hard gate, not a silent guess): this script
-refuses to start unless audio.channel_roles_verified: true is set in the
-config, which should only happen after running
+BUDGET-DRIVEN CHOICE: the k-means quantizer and the unit-to-waveform
+vocoder are pretrained, frozen, and never trained in this codebase --
+training a neural audio codec or GAN vocoder from scratch would not fit
+inside a single Colab A100 session's budget. Only the embedding, LoRA
+adapters, and classification head are trained here.
+
+CHANNEL-ROLE ASSUMPTION (still a hard gate, not a silent guess): this
+script refuses to start unless audio.channel_roles_verified: true is set
+in the config, which should only happen after running
 dataprep/print_channel_roles.py and confirming audio.user_channel /
 audio.agent_channel against the real otoSpeech speaker-role metadata.
 
-DUPLEX FUSION NO LONGER TAKES AGENT AUDIO AS INPUT (corrected design, not
-just a refactor -- see speechcore/duplex_fusion.py's docstring for the
-full reasoning). The previous version fed the real ground-truth agent
-audio's embedding (shifted by one 20ms frame) into the model's own input
-at every frame. Adjacent real-speech frames are highly autocorrelated, so
-this gave the model an easy shortcut -- echo the ground truth forward --
-instead of learning genuine content generation from the user audio and
-its own understanding. It also meant training and real inference used
-different mechanisms (real inference has no ground-truth agent audio to
-lean on), which is exactly why generation-time self-feedback kept
-producing noise no amount of inference-side signal processing fixed: the
-model never actually learned to generate independently. The speech core's
-own causal self-attention over its own past hidden states is what now
-carries "memory of what I've been saying" -- the standard way any
-autoregressive transformer conditions on its own history -- so only the
-user stream is ever fed in as external input. This is a breaking change:
-old checkpoints trained against the previous DuplexFusion signature are
-not compatible and must be retrained from scratch.
-
-SPECTRAL FLUX LOSS (addresses a SEPARATE, well-documented limitation of
-plain L1 mel regression, not the leakage bug above): per MELLE
-(arXiv:2407.08551) and Ren et al. ("Revisiting Over-Smoothness in Text to
-Speech"), deterministic L1/L2 regression against mel targets tends to
-produce over-smoothed, blurry predictions -- averaging over plausible
-spectral detail minimizes L1 loss even though the average doesn't match
-any real frame. A spectral-flux term (L1 loss on the frame-to-frame
-first-order difference of predicted vs. target mel, weighted by
-train.flux_loss_weight) directly penalizes under-predicting the target's
-real temporal variation. This does not fully solve over-smoothing (MELLE
-also uses a variational/latent-sampling module instead of a deterministic
-readout, which this codebase does not implement) -- it is a cheap,
-directionally-correct mitigation, not a complete fix.
+BREAKING CHANGE: checkpoints from any earlier version of this script
+(continuous-mel or the pre-fix duplex-fusion design) are not compatible
+and must be retrained from scratch.
 """
 from __future__ import annotations
 
@@ -86,14 +67,11 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # allow `python train/stage2_duplex.py`
 
-from acoustichead.mel_head import MelHead
+from acoustichead.unit_head import UnitHead
 from common import ensure_dir, load_config, pick_device
-from encoder.wavlm_encoder import WAVLM_SAMPLE_RATE, WavLMEncoder
-from projector.projector import Projector
-from speechcore.duplex_fusion import DuplexFusion
+from projector.unit_embedding import UnitEmbedding
+from speechcore.discrete_tokenizer import DiscreteSpeechTokenizer
 from speechcore.qwen_speech_core import QwenSpeechCore
-from vocoder.mel_utils import VOCOS_SAMPLE_RATE
-from vocoder.vocos_wrapper import VocosVocoder
 
 
 class SessionChunkDataset(Dataset):
@@ -166,8 +144,15 @@ def collate_variable_length(batch):
 
 
 def build_models(cfg: dict, device: torch.device, dtype: torch.dtype):
-    wavlm = WavLMEncoder(cfg["models"]["wavlm_name"], device=device)
-    vocos = VocosVocoder(cfg["models"]["vocos_repo"], device=device)
+    tokenizer = DiscreteSpeechTokenizer(
+        ssl_model=cfg["discrete"]["ssl_model"],
+        layer_num=cfg["discrete"]["layer_num"],
+        num_clusters=cfg["discrete"]["num_clusters"],
+        kmeans_dataset=cfg["discrete"]["kmeans_dataset"],
+        kmeans_repo_id=cfg["discrete"]["kmeans_repo_id"],
+        vocoder_repo_id=cfg["discrete"]["vocoder_repo_id"],
+        device=device,
+    )
     qwen_core = QwenSpeechCore(
         cfg["models"]["qwen_name"],
         device=device,
@@ -178,30 +163,28 @@ def build_models(cfg: dict, device: torch.device, dtype: torch.dtype):
         dtype=dtype,
     )
     hidden_size = qwen_core.hidden_size
-    projector = Projector(d_in=768, d_out=hidden_size).to(device=device, dtype=dtype)
-    fusion = DuplexFusion(d_in=hidden_size, d_hidden=hidden_size).to(device=device, dtype=dtype)
-    acoustic_head = MelHead(d_in=hidden_size, n_mels=cfg["audio"]["n_mels"]).to(device=device, dtype=dtype)
-    return wavlm, vocos, qwen_core, projector, fusion, acoustic_head
+    vocab_size = cfg["discrete"]["num_clusters"]
+    embedding = UnitEmbedding(vocab_size=vocab_size, d_out=hidden_size).to(device=device, dtype=dtype)
+    unit_head = UnitHead(d_in=hidden_size, vocab_size=vocab_size).to(device=device, dtype=dtype)
+    return tokenizer, qwen_core, embedding, unit_head
 
 
-def trainable_param_groups(qwen_core, projector, fusion, acoustic_head):
+def trainable_param_groups(qwen_core, embedding, unit_head):
     return (
         list(qwen_core.trainable_parameters())
-        + list(projector.parameters())
-        + list(fusion.parameters())
-        + list(acoustic_head.parameters())
+        + list(embedding.parameters())
+        + list(unit_head.parameters())
     )
 
 
-def save_checkpoint(ckpt_dir: Path, step: int, qwen_core, projector, fusion, acoustic_head, optimizer):
+def save_checkpoint(ckpt_dir: Path, step: int, qwen_core, embedding, unit_head, optimizer):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     qwen_core.model.save_pretrained(str(ckpt_dir / "qwen_lora"))
     torch.save(
         {
             "step": step,
-            "projector": projector.state_dict(),
-            "fusion": fusion.state_dict(),
-            "acoustic_head": acoustic_head.state_dict(),
+            "embedding": embedding.state_dict(),
+            "unit_head": unit_head.state_dict(),
             "optimizer": optimizer.state_dict(),
         },
         ckpt_dir / "train_state.pt",
@@ -209,15 +192,14 @@ def save_checkpoint(ckpt_dir: Path, step: int, qwen_core, projector, fusion, aco
     print(f"[checkpoint] saved at step {step} -> {ckpt_dir}")
 
 
-def try_resume(ckpt_dir: Path, qwen_core, projector, fusion, acoustic_head, optimizer, device) -> int:
+def try_resume(ckpt_dir: Path, qwen_core, embedding, unit_head, optimizer, device) -> int:
     state_path = ckpt_dir / "train_state.pt"
     if not state_path.exists():
         return 0
     print(f"[resume] found checkpoint at {ckpt_dir}, loading...")
     state = torch.load(state_path, map_location=device)
-    projector.load_state_dict(state["projector"])
-    fusion.load_state_dict(state["fusion"])
-    acoustic_head.load_state_dict(state["acoustic_head"])
+    embedding.load_state_dict(state["embedding"])
+    unit_head.load_state_dict(state["unit_head"])
     optimizer.load_state_dict(state["optimizer"])
     from peft import PeftModel
 
@@ -249,10 +231,11 @@ def train(cfg_path: str, resume: bool = True) -> None:
     ckpt_dir = ensure_dir(cfg["paths"]["checkpoint_dir"])
 
     print(f"Device: {device}, dtype: {dtype}")
-    wavlm, vocos, qwen_core, projector, fusion, acoustic_head = build_models(cfg, device, dtype)
+    tokenizer, qwen_core, embedding, unit_head = build_models(cfg, device, dtype)
     print("=== Qwen speech core ===")
     for k, v in qwen_core.verify_loaded().items():
         print(f"  {k}: {v}")
+    print(f"Discrete unit vocab size: {tokenizer.vocab_size}")
 
     dataset = SessionChunkDataset(
         manifest_path=cfg["paths"]["manifest_path"],
@@ -274,22 +257,23 @@ def train(cfg_path: str, resume: bool = True) -> None:
     )
 
     optimizer = torch.optim.AdamW(
-        trainable_param_groups(qwen_core, projector, fusion, acoustic_head),
+        trainable_param_groups(qwen_core, embedding, unit_head),
         lr=cfg["train"]["lr"],
     )
 
-    start_step = try_resume(ckpt_dir, qwen_core, projector, fusion, acoustic_head, optimizer, device) if resume else 0
+    start_step = try_resume(ckpt_dir, qwen_core, embedding, unit_head, optimizer, device) if resume else 0
 
     log_path = ckpt_dir / "train_log.csv"
     log_is_new = not log_path.exists()
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if log_is_new:
-        log_writer.writerow(["step", "loss", "recon_loss", "flux_loss", "lr", "epoch", "wall_time_s"])
+        log_writer.writerow(["step", "loss", "accuracy", "lr", "epoch", "wall_time_s"])
 
     max_steps = cfg["train"]["max_steps"]
     save_every = cfg["train"]["save_every"]
     log_every = cfg["train"].get("log_every", 10)
+    native_sr = dataset.native_sr
     t0 = time.time()
     step = start_step
     epoch = 0
@@ -301,93 +285,73 @@ def train(cfg_path: str, resume: bool = True) -> None:
             if step >= max_steps:
                 break
 
-            native_sr = dataset.native_sr
-            # Deliberately kept on CPU here: WavLMEncoder/VocosVocoder both move
-            # their inputs to the model's own device internally, and
-            # WavLMEncoder's feature extractor needs CPU tensors (it calls
-            # .numpy() on each row) -- moving to `device` first would break that.
-            user_16k = [torchaudio.functional.resample(w, native_sr, WAVLM_SAMPLE_RATE) for w in user_list]
-            agent_24k = [torchaudio.functional.resample(w, native_sr, VOCOS_SAMPLE_RATE) for w in agent_list]
-            batch_size = len(user_16k)
-
+            # Encode both streams to discrete units. Per-item (not batched)
+            # because DiscreteSSL's batching semantics for variable-length,
+            # unpadded audio aren't something to assume without verifying --
+            # correctness first, batch-encode as a speed optimization later
+            # if throughput on the actual A100 run needs it.
             with torch.no_grad():
-                # Only the user stream is ever encoded as model input now --
-                # agent audio is used solely to build the loss target below,
-                # never fed into the model (see the duplex-fusion note above).
-                user_feat, frame_mask = wavlm(user_16k, WAVLM_SAMPLE_RATE)
+                user_units_list = [tokenizer.encode(u, native_sr) for u in user_list]
+                agent_units_list = [tokenizer.encode(a, native_sr) for a in agent_list]
 
-                # Exact per-item mel targets (no batch-wide length assumption),
-                # then zero-padded to the batch's max mel length with an explicit mask.
-                mel_items = [vocos.mel_from_waveform(a.unsqueeze(0)).squeeze(0) for a in agent_24k]
-                n_mels = mel_items[0].shape[0]
-                t_mel_max = max(m.shape[-1] for m in mel_items)
-                target_mel = torch.zeros(batch_size, n_mels, t_mel_max, device=device)
-                mel_mask = torch.zeros(batch_size, t_mel_max, dtype=torch.bool, device=device)
-                for i, m in enumerate(mel_items):
-                    t_i = m.shape[-1]
-                    target_mel[i, :, :t_i] = m
-                    mel_mask[i, :t_i] = True
+            # Both streams come from the same chunk duration through the same
+            # WavLM+k-means pipeline, so their frame counts must match exactly
+            # -- asserted, not assumed, so a real mismatch fails loudly instead
+            # of silently misaligning user input against agent target.
+            for i, (u, a) in enumerate(zip(user_units_list, agent_units_list)):
+                assert u.shape[0] == a.shape[0], (
+                    f"batch item {i}: user/agent unit counts differ ({u.shape[0]} vs {a.shape[0]}) -- "
+                    f"this should be impossible for equal-length input audio, investigate the tokenizer."
+                )
+
+            batch_size = len(user_units_list)
+            t_max = max(u.shape[0] for u in user_units_list)
+            user_units = torch.zeros(batch_size, t_max, dtype=torch.long, device=device)
+            target_units = torch.zeros(batch_size, t_max, dtype=torch.long, device=device)
+            frame_mask = torch.zeros(batch_size, t_max, dtype=torch.long, device=device)
+            for i, (u, a) in enumerate(zip(user_units_list, agent_units_list)):
+                t_i = u.shape[0]
+                user_units[i, :t_i] = u
+                target_units[i, :t_i] = a
+                frame_mask[i, :t_i] = 1
 
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(dtype != torch.float32)):
-                user_emb = projector(user_feat.to(dtype))
-                fused = fusion(user_emb)
+                user_emb = embedding(user_units)  # (B, T, hidden)
+                hidden = qwen_core(user_emb, attention_mask=frame_mask)  # (B, T, hidden)
+                logits = unit_head(hidden).float()  # (B, T, vocab)
 
-                hidden = qwen_core(fused, attention_mask=frame_mask)  # (B, T_wavlm, hidden)
-                pred_mel_full = acoustic_head(hidden).transpose(1, 2).float()  # (B, n_mels, T_wavlm)
+                flat_logits = logits.reshape(-1, logits.shape[-1])
+                flat_targets = target_units.reshape(-1)
+                flat_mask = frame_mask.reshape(-1).float()
 
-                # Resample each item's prediction from WavLM's rate to ITS OWN true
-                # mel length, using only its valid (unpadded) region -- not a
-                # batch-wide average, and never touching padded frames.
-                pred_mel_aligned = torch.zeros_like(target_mel)
-                for i in range(batch_size):
-                    t_wavlm_i = int(frame_mask[i].sum().item())
-                    t_mel_i = int(mel_mask[i].sum().item())
-                    valid_pred = pred_mel_full[i : i + 1, :, :t_wavlm_i]
-                    aligned = F.interpolate(valid_pred, size=t_mel_i, mode="linear", align_corners=False)
-                    pred_mel_aligned[i, :, :t_mel_i] = aligned.squeeze(0)
+                per_frame_loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+                loss = (per_frame_loss * flat_mask).sum() / flat_mask.sum().clamp_min(1.0)
 
-                mask_f = mel_mask.unsqueeze(1).to(target_mel.dtype)  # (B, 1, T_mel_max)
-                abs_diff = (pred_mel_aligned - target_mel).abs() * mask_f
-                recon_loss = abs_diff.sum() / (mask_f.sum() * n_mels).clamp_min(1.0)
-
-                # Spectral flux loss (per MELLE, arXiv:2407.08551, and Ren et al.
-                # "Revisiting Over-Smoothness in TTS"): plain L1/L2 mel regression
-                # is documented to cause over-smoothed/blurry output, because
-                # averaging over plausible details minimizes L1 loss even though
-                # it doesn't match any real frame. Penalizing the mismatch in
-                # frame-to-frame variation directly discourages the model from
-                # under-predicting the target's actual temporal variation.
-                pred_flux = pred_mel_aligned[:, :, 1:] - pred_mel_aligned[:, :, :-1]
-                target_flux = target_mel[:, :, 1:] - target_mel[:, :, :-1]
-                flux_mask = mask_f[:, :, 1:]  # a flux frame is valid only if both frames behind it are
-                flux_diff = (pred_flux - target_flux).abs() * flux_mask
-                flux_loss = flux_diff.sum() / (flux_mask.sum() * n_mels).clamp_min(1.0)
-
-                flux_weight = cfg["train"].get("flux_loss_weight", 0.5)
-                loss = recon_loss + flux_weight * flux_loss
+                with torch.no_grad():
+                    preds = flat_logits.argmax(dim=-1)
+                    accuracy = ((preds == flat_targets).float() * flat_mask).sum() / flat_mask.sum().clamp_min(1.0)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_param_groups(qwen_core, projector, fusion, acoustic_head), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_param_groups(qwen_core, embedding, unit_head), 1.0)
             optimizer.step()
             step += 1
 
             if step % log_every == 0:
                 elapsed = time.time() - t0
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"step {step}/{max_steps} | epoch {epoch} | loss {loss.item():.4f} "
-                      f"(recon {recon_loss.item():.4f} + {flux_weight}*flux {flux_loss.item():.4f}) | "
-                      f"elapsed {elapsed:.0f}s")
-                log_writer.writerow([step, loss.item(), recon_loss.item(), flux_loss.item(), lr, epoch, elapsed])
+                print(f"step {step}/{max_steps} | epoch {epoch} | loss {loss.item():.4f} | "
+                      f"unit-accuracy {accuracy.item():.3f} | elapsed {elapsed:.0f}s")
+                log_writer.writerow([step, loss.item(), accuracy.item(), lr, epoch, elapsed])
                 log_file.flush()
 
             if step % save_every == 0:
-                save_checkpoint(ckpt_dir, step, qwen_core, projector, fusion, acoustic_head, optimizer)
+                save_checkpoint(ckpt_dir, step, qwen_core, embedding, unit_head, optimizer)
 
         if step >= max_steps:
             break
 
-    save_checkpoint(ckpt_dir, step, qwen_core, projector, fusion, acoustic_head, optimizer)
+    save_checkpoint(ckpt_dir, step, qwen_core, embedding, unit_head, optimizer)
     log_file.close()
     print(f"Training finished at step {step}.")
 

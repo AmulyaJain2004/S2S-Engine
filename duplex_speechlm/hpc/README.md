@@ -54,7 +54,9 @@ qstat -u $USER
 
 Since you'll check results the next day: `run_stage2.pbs` logs to
 `stage2_job.log` in the submit directory, and the training script itself
-writes `checkpoint_dir/train_log.csv` (step, loss, lr, epoch, wall time) plus
+writes `checkpoint_dir/train_log.csv` (step, loss, **accuracy**, lr, epoch,
+wall time -- accuracy is the discrete-unit prediction accuracy, a much
+more directly readable signal than the old mel-regression loss was) plus
 a checkpoint every `save_every` steps. If the job dies from hitting
 `walltime` before `max_steps`, just `qsub hpc/run_stage2.pbs` again --
 `train/stage2_duplex.py`'s `try_resume` picks up from the last checkpoint
@@ -65,10 +67,10 @@ not chain resumes.
 ## Listening to what it actually generated
 
 The cluster has no speakers, so this just produces WAV files to pull back
-and listen to locally. `eval/generate_stage2.py` runs genuine autoregressive
-generation (the model's own synthesized audio feeds the next window, not
-ground truth -- see that script's docstring for why this differs from
-training) on a real held-out user-channel clip:
+and listen to locally. `eval/generate_stage2.py` encodes the user audio
+into discrete units and runs windowed, KV-cached generation -- the same
+mechanism as training, no self-feedback loop -- on a real held-out
+user-channel clip:
 
 ```bash
 python eval/generate_stage2.py \
@@ -84,20 +86,20 @@ Then from your local machine:
 scp you@cluster-login:~/s2s-engine/outputs/generation_check/*.wav .
 ```
 
-A falling `train_log.csv` loss alone doesn't tell you the output is
-intelligible or well-timed -- actually listening to `generated_agent.wav`
-is the real check.
+A falling loss / rising accuracy in `train_log.csv` alone doesn't tell you
+the output is intelligible or well-timed -- actually listening to
+`generated_agent.wav` is the real check.
 
 ## Syncing checkpoints back
 
 ```bash
 # from your local machine
-scp -r you@cluster-login:~/s2s-engine/<checkpoint_dir>/stage2 ./checkpoints_from_hpc
+scp -r you@cluster-login:~/s2s-engine/<checkpoint_dir>/stage2_discrete ./checkpoints_from_hpc
 ```
 
 Or push just `train_log.csv` for a quick look without pulling full model
 checkpoints:
 
 ```bash
-scp you@cluster-login:~/s2s-engine/<checkpoint_dir>/stage2/train_log.csv .
+scp you@cluster-login:~/s2s-engine/<checkpoint_dir>/stage2_discrete/train_log.csv .
 ```

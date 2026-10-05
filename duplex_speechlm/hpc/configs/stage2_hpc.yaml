@@ -1,16 +1,25 @@
 # Stage 2 config for the college H100 PBS cluster.
 # EDIT the two scratch paths below to match your actual cluster scratch/home
 # quota paths before qsub-ing -- these are placeholders.
+#
+# ARCHITECTURE: discrete units (WavLM-large + k-means(1000), pretrained and
+# frozen), not continuous mel regression -- see
+# speechcore/discrete_tokenizer.py's docstring for the full reasoning.
 
 models:
-  wavlm_name: "microsoft/wavlm-base-plus"
   qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  vocos_repo: "charactr/vocos-mel-24khz"
+
+discrete:
+  ssl_model: "wavlm-large"
+  layer_num: 7
+  num_clusters: 1000
+  kmeans_dataset: "LJSpeech"
+  kmeans_repo_id: "speechbrain/SSL_Quantization"
+  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"
 
 audio:
   chunk_duration_s: 8.0
   min_chunk_s: 1.0
-  n_mels: 100
   user_channel: 0           # Run dataprep/print_channel_roles.py and confirm this yourself -- NOTE: this
   agent_channel: 1          # dataset may turn out to be peer-to-peer (no real "agent" role), in which case
                             # this is just a fixed, consistent choice of which channel the model learns to
@@ -29,7 +38,6 @@ train:
   save_every: 500
   log_every: 20
   num_workers: 8
-  flux_loss_weight: 0.5
 
 runtime:
   device: "cuda"
@@ -37,4 +45,4 @@ runtime:
 
 paths:
   manifest_path: "/scratch/CHANGE_ME/s2s-engine/processed/manifest.json"
-  checkpoint_dir: "/scratch/CHANGE_ME/s2s-engine/checkpoints/stage2"
+  checkpoint_dir: "/scratch/CHANGE_ME/s2s-engine/checkpoints/stage2_discrete"

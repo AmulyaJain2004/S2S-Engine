@@ -3,6 +3,7 @@ torchaudio
 transformers
 peft
 vocos
+speechbrain
 datasets
 torchcodec
 huggingface_hub

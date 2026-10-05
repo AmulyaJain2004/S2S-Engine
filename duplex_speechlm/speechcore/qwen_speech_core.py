@@ -8,12 +8,12 @@ now implemented.
 
 - "Embedding-path override": HF's AutoModelForCausalLM already accepts
   `inputs_embeds` in place of `input_ids` -- no architecture surgery is
-  needed to feed it continuous projector/fusion embeddings. "Replacing the
-  LM head with the acoustic head" means: never call the model's own
-  `lm_head`; instead take `output_hidden_states=True` and read the last
-  hidden state, which the caller (train/stage2_duplex.py) feeds into
-  acoustichead/mel_head.py. The pretrained lm_head is left untouched but
-  unused.
+  needed to feed it the unit embeddings from projector/unit_embedding.py.
+  "Replacing the LM head with the unit head" means: never call the
+  model's own `lm_head`; instead take `output_hidden_states=True` and read
+  the last hidden state, which the caller (train/stage2_duplex.py) feeds
+  into acoustichead/unit_head.py's classification head. The pretrained
+  lm_head is left untouched but unused.
 - LoRA: applied via peft, targeting Qwen2's attention + MLP projections.
   The base weights stay frozen; only LoRA adapters train.
 """

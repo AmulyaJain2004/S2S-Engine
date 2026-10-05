@@ -2,17 +2,29 @@
 # Copy this file (e.g. stage2_colab.yaml / stage2_hpc.yaml) if Colab and the
 # HPC cluster need different paths/batch sizes -- don't hand-edit in place
 # between the two environments.
+#
+# ARCHITECTURE: discrete units (WavLM-large + k-means(1000), pretrained and
+# frozen), not continuous mel regression -- see
+# speechcore/discrete_tokenizer.py's docstring for the full reasoning.
+# models.wavlm_name / models.vocos_repo from the old continuous pipeline
+# are gone; the discrete: section below replaces them.
 
 models:
-  wavlm_name: "microsoft/wavlm-base-plus"
   qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  vocos_repo: "charactr/vocos-mel-24khz"
+
+discrete:
+  ssl_model: "wavlm-large"                                  # NOT wavlm-base-plus -- must match the
+                                                              # pretrained k-means/vocoder's own training setup
+  layer_num: 7
+  num_clusters: 1000
+  kmeans_dataset: "LJSpeech"
+  kmeans_repo_id: "speechbrain/SSL_Quantization"
+  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"  # pretrained, frozen -- never trained here
 
 audio:
   chunk_duration_s: 8.0     # target training chunk length; the final chunk of each session is shorter
                             # and kept (not dropped) as long as it's >= min_chunk_s -- see stage2_duplex.py
   min_chunk_s: 1.0          # shorter trailing remainders than this are dropped, too little signal to bother with
-  n_mels: 100               # must match charactr/vocos-mel-24khz's own feature extractor
   user_channel: 0           # Run dataprep/print_channel_roles.py and confirm this yourself -- NOTE: this
   agent_channel: 1          # dataset may turn out to be peer-to-peer (no real "agent" role), in which case
                             # this is just a fixed, consistent choice of which channel the model learns to
@@ -25,15 +37,14 @@ lora:
   dropout: 0.05
 
 train:
-  batch_size: 4             # A100 40GB: start here and raise if memory allows; H100 80GB can go higher
+  batch_size: 4             # A100 40GB: start here and raise if memory allows; H100 80GB can go higher.
+                            # WavLM-large is heavier than base-plus, and it now runs on BOTH user and
+                            # agent streams every step -- lower this first if you hit OOM.
   lr: 2.0e-4
   max_steps: 20000
   save_every: 500
   log_every: 10
   num_workers: 4
-  flux_loss_weight: 0.5     # spectral-flux term (MELLE, arXiv:2407.08551) that penalizes under-predicting
-                            # frame-to-frame mel variation -- counters the over-smoothing plain L1/L2
-                            # regression is documented to cause. 0.0 disables it if it ever misbehaves.
 
 runtime:
   device: "cuda"
@@ -41,4 +52,4 @@ runtime:
 
 paths:
   manifest_path: "processed/manifest.json"
-  checkpoint_dir: "checkpoints/stage2"
+  checkpoint_dir: "checkpoints/stage2_discrete"   # NEW path -- not compatible with any earlier checkpoint
