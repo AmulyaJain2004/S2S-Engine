@@ -33,6 +33,19 @@ current window in isolation.
 FIRST WINDOW: there is no self-generated history yet, so duplex fusion
 for window 0 uses the learned start token (the same one position 0 uses
 in training) broadcast across the whole window, not a single frame.
+
+CLAMPING THE SELF-FED AUDIO (fixes a real, confirmed bug, not a cosmetic
+safeguard): Vocos's raw output is NOT guaranteed to stay within [-1, 1] --
+nothing in vocos_wrapper.py/mel_utils.py clips it. WavLM, however, expects
+input in roughly that range (it was pretrained on normalized natural
+speech); feeding it out-of-range values produces badly corrupted
+features. The teacher-forced path (train/stage2_duplex.py,
+eval/teacher_forced_check.py) NEVER re-encodes synthesized audio through
+WavLM, so it was never exposed to this. This self-feedback path does, every
+single window, which compounds across windows -- confirmed by
+teacher_forced_check.py sounding clean while this script's output didn't.
+Every self-fed chunk is clamped to [-1, 1] before being re-encoded (and
+before being saved/concatenated) to close this off.
 """
 from __future__ import annotations
 
@@ -140,6 +153,11 @@ def generate(cfg_path: str, user_wav_path: str, window_s: float, max_duration_s:
         pred_mel = F.interpolate(pred_mel, size=target_mel_frames, mode="linear", align_corners=False)
 
         waveform_window = vocos.waveform_from_mel(pred_mel).cpu().squeeze(0)  # (n_samples_24k,)
+        raw_min, raw_max = waveform_window.min().item(), waveform_window.max().item()
+        if raw_min < -1.0 or raw_max > 1.0:
+            print(f"  [window {i + 1}] Vocos output out of [-1, 1] before clamping: "
+                  f"min={raw_min:.3f} max={raw_max:.3f} -- this is exactly the corruption this clamp prevents.")
+        waveform_window = waveform_window.clamp(-1.0, 1.0)
         synthesized_chunks.append(waveform_window)
 
         prev_output_wave_native = torchaudio.functional.resample(waveform_window, VOCOS_SAMPLE_RATE, native_sr)
