@@ -9,3 +9,5 @@ inference_webapp/backend/server.log
 # local-only scratch used to verify the SpeechBrain DiscreteSSL API against
 # the real installed package before shipping -- not part of the project
 scratch_verify/
+image.png
+speech_lm_architecture_detailed.png
