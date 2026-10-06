@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Duplex Speech LM — Live Inference</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+
+  <main class="page">
+    <header class="hero">
+      <div class="hero-badge" id="statusBadge">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Checking server…</span>
+      </div>
+      <h1>Duplex Speech&nbsp;LM</h1>
+      <p class="subtitle">Live inference for the archived Stage&nbsp;2 checkpoint — upload or record a clip and hear what the model generates.</p>
+      <p class="caveat" id="caveat">
+        This checkpoint predates the duplex-fusion fix: during training it could lean on the real ground-truth
+        audio instead of learning independent generation, so self-feedback generation here may sound rough.
+        Treat this as a snapshot of an early run, not the model's ceiling.
+      </p>
+    </header>
+
+    <section class="card">
+      <h2>1. Mode</h2>
+      <div class="mode-toggle">
+        <button class="mode-btn active" id="modeSelfFeedback" type="button" data-mode="self_feedback">
+          Self-feedback <span class="mode-sub">realistic, but rougher</span>
+        </button>
+        <button class="mode-btn" id="modeTeacherForced" type="button" data-mode="teacher_forced">
+          Teacher-forced <span class="mode-sub">diagnostic, needs the real answer</span>
+        </button>
+      </div>
+      <p class="mode-help" id="modeHelp">
+        The model generates its response window-by-window, feeding its own output back in as it goes —
+        this is the only mode that reflects how the model would actually be used.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2 id="step2Title">2. Provide a clip</h2>
+
+      <div id="selfFeedbackInputs">
+        <div class="input-row">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span id="dropzoneText">Drop a WAV here, or click to browse</span>
+            <input type="file" id="fileInput" accept="audio/*" hidden />
+          </label>
+
+          <div class="or-divider"><span>or</span></div>
+
+          <button class="record-btn" id="recordBtn" type="button">
+            <span class="record-dot"></span>
+            <span id="recordLabel">Record from mic</span>
+          </button>
+        </div>
+
+        <div class="clip-preview" id="clipPreview" hidden>
+          <span class="clip-name" id="clipName"></span>
+          <audio controls id="clipAudio"></audio>
+          <button class="ghost-btn" id="clearClip" type="button">Clear</button>
+        </div>
+      </div>
+
+      <div id="teacherForcedInputs" hidden>
+        <p class="mode-help">
+          Both clips must be the SAME time window of a real two-channel recording — e.g. a user/agent pair
+          from otoSpeech. This mode feeds the model the real answer (shifted one frame), so it only works
+          with real paired audio, not a clip you record yourself.
+        </p>
+
+        <div class="mode-toggle source-toggle">
+          <button class="mode-btn active" id="sourceUpload" type="button">Upload files</button>
+          <button class="mode-btn" id="sourceDrive" type="button">From Google Drive link</button>
+        </div>
+
+        <div id="teacherForcedUploadInputs">
+          <div class="input-row">
+            <label class="dropzone" id="dropzoneUser" for="fileInputUser">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6">
+                <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span id="dropzoneUserText">User clip</span>
+              <input type="file" id="fileInputUser" accept="audio/*" hidden />
+            </label>
+            <label class="dropzone" id="dropzoneAgent" for="fileInputAgent">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6">
+                <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              <span id="dropzoneAgentText">Agent (ground truth) clip</span>
+              <input type="file" id="fileInputAgent" accept="audio/*" hidden />
+            </label>
+          </div>
+
+          <div class="clip-preview" id="clipPreviewUser" hidden>
+            <span class="clip-name" id="clipNameUser"></span>
+            <audio controls id="clipAudioUser"></audio>
+            <button class="ghost-btn" id="clearClipUser" type="button">Clear</button>
+          </div>
+          <div class="clip-preview" id="clipPreviewAgent" hidden>
+            <span class="clip-name" id="clipNameAgent"></span>
+            <audio controls id="clipAudioAgent"></audio>
+            <button class="ghost-btn" id="clearClipAgent" type="button">Clear</button>
+          </div>
+        </div>
+
+        <div id="teacherForcedDriveInputs" hidden>
+          <p class="mode-help">
+            Both files must be shared as <strong>"Anyone with the link"</strong> in Google Drive first
+            (right-click → Share). Paste the share links below — the server downloads the full session
+            files and trims them to the window you specify, so you don't have to cut clips yourself.
+          </p>
+          <label class="drive-field">
+            <span>User clip Drive link</span>
+            <input type="text" id="driveUserLink" placeholder="https://drive.google.com/file/d/.../view" />
+          </label>
+          <label class="drive-field">
+            <span>Agent (ground truth) clip Drive link</span>
+            <input type="text" id="driveAgentLink" placeholder="https://drive.google.com/file/d/.../view" />
+          </label>
+          <div class="settings-grid">
+            <label class="setting">
+              <span>Start offset <em id="driveOffsetVal">60s</em></span>
+              <input type="range" id="driveOffsetSlider" min="0" max="300" step="5" value="60" />
+            </label>
+            <label class="setting">
+              <span>Clip length <em id="driveDurationVal">8s</em></span>
+              <input type="range" id="driveDurationSlider" min="2" max="20" step="1" value="8" />
+            </label>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="settingsCard">
+      <h2>3. Generation settings</h2>
+      <div class="settings-grid">
+        <label class="setting">
+          <span>Window size <em id="windowVal">0.4s</em></span>
+          <input type="range" id="windowSlider" min="0.2" max="1.0" step="0.1" value="0.4" />
+        </label>
+        <label class="setting">
+          <span>Max clip length <em id="durationVal">30s</em></span>
+          <input type="range" id="durationSlider" min="5" max="60" step="5" value="30" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <button class="primary-btn" id="generateBtn" disabled>
+        <span id="generateLabel">Generate</span>
+      </button>
+    </section>
+
+    <section class="card progress-card" id="progressCard" hidden>
+      <h2>Generating…</h2>
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <p class="progress-pct"><span id="progressStage"></span> <span id="progressPct">0%</span></p>
+    </section>
+
+    <section class="card results-card" id="resultsCard" hidden>
+      <h2>Results</h2>
+      <div class="results-grid" id="resultsGrid">
+        <div class="result">
+          <h3>Input (what the model heard)</h3>
+          <audio controls id="inputPlayer"></audio>
+        </div>
+        <div class="result" id="groundTruthResult" hidden>
+          <h3>Ground truth (the real answer)</h3>
+          <audio controls id="groundTruthPlayer"></audio>
+        </div>
+        <div class="result">
+          <h3>Generated</h3>
+          <audio controls id="outputPlayer"></audio>
+        </div>
+      </div>
+    </section>
+
+    <section class="card error-card" id="errorCard" hidden>
+      <h2>Something went wrong</h2>
+      <p id="errorText"></p>
+    </section>
+
+    <footer class="footnote">
+      Checkpoint step <span id="footStep">—</span> · running on <span id="footDevice">—</span>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -4,6 +4,7 @@ transformers
 peft
 vocos
 speechbrain
+scikit-learn
 datasets
 torchcodec
 huggingface_hub

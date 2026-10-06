@@ -10,12 +10,11 @@ models:
   qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
 
 discrete:
-  ssl_model: "wavlm-large"
+  ssl_model: "microsoft/wavlm-large"   # full HF repo id, not a short name
   layer_num: 7
   num_clusters: 1000
-  kmeans_dataset: "LJSpeech"
-  kmeans_repo_id: "speechbrain/SSL_Quantization"
-  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"
+  kmeans_dataset: "LibriSpeech"        # verified against the actual repo
+  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"  # also hosts the k-means checkpoints
 
 audio:
   chunk_duration_s: 8.0

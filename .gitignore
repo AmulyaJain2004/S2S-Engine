@@ -1,1 +1,11 @@
 archive/
+
+# downloaded checkpoints for the live inference web UI -- large, never commit
+inference_webapp/checkpoint/
+inference_webapp/backend/.venv/
+inference_webapp/backend/__pycache__/
+inference_webapp/backend/server.log
+
+# local-only scratch used to verify the SpeechBrain DiscreteSSL API against
+# the real installed package before shipping -- not part of the project
+scratch_verify/

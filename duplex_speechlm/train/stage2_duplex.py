@@ -149,7 +149,6 @@ def build_models(cfg: dict, device: torch.device, dtype: torch.dtype):
         layer_num=cfg["discrete"]["layer_num"],
         num_clusters=cfg["discrete"]["num_clusters"],
         kmeans_dataset=cfg["discrete"]["kmeans_dataset"],
-        kmeans_repo_id=cfg["discrete"]["kmeans_repo_id"],
         vocoder_repo_id=cfg["discrete"]["vocoder_repo_id"],
         device=device,
     )

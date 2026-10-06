@@ -13,13 +13,13 @@ models:
   qwen_name: "Qwen/Qwen2.5-1.5B-Instruct"
 
 discrete:
-  ssl_model: "wavlm-large"                                  # NOT wavlm-base-plus -- must match the
-                                                              # pretrained k-means/vocoder's own training setup
+  ssl_model: "microsoft/wavlm-large"   # full HF repo id -- NOT a short name, and NOT wavlm-base-plus
   layer_num: 7
   num_clusters: 1000
-  kmeans_dataset: "LJSpeech"
-  kmeans_repo_id: "speechbrain/SSL_Quantization"
-  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"  # pretrained, frozen -- never trained here
+  kmeans_dataset: "LibriSpeech"        # verified against the actual repo; "LJSpeech" (an earlier, unverified
+                                        # guess) is wrong and silently fails to locate the k-means file
+  vocoder_repo_id: "speechbrain/hifigan-wavlm-k1000-LibriTTS"  # also hosts the k-means checkpoints --
+                                        # pretrained, frozen -- never trained here
 
 audio:
   chunk_duration_s: 8.0     # target training chunk length; the final chunk of each session is shorter
